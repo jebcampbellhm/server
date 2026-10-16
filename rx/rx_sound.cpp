@@ -54,6 +54,7 @@ Boston, MA  02110-1301, USA.
 #include "dx.h"
 #include "noise_blank.h"
 #include "rx_sound.h"
+#include "iq_timing.h"
 #include "rx_sound_cmd.h"
 #include "rx_waterfall.h"
 #include "rx_filter.h"
@@ -78,18 +79,6 @@ Boston, MA  02110-1301, USA.
 
 
 snd_t snd_inst[MAX_RX_CHANS];
-
-// 1st estimate of processing delay
-const double gps_delay = 28926.838e-6;
-const double gps_week_sec = 7 * 24 * 3600.0;
-
-struct gps_timestamp_t {
-    bool init;
-    double gpssec;      // current gps timestamp
-    double last_gpssec; // last gps timestamp
-};
-
-gps_timestamp_t gps_ts[MAX_RX_CHANS];
 
 float g_genfreq, g_genampl, g_mixfreq;
 
@@ -286,29 +275,6 @@ void c2s_sound(void* param) {
     wdsp_SAM_PLL(rx_chan, PLL_MED);
     wdsp_SAM_PLL(rx_chan, PLL_RESET);
 
-    gps_timestamp_t* gps_tsp = &gps_ts[rx_chan];
-    memset(gps_tsp, 0, sizeof(gps_timestamp_t));
-
-    // Compensate for audio sample buffer size in FPGA. Normalize to buffer size used for FW_SEL_SDR_RX4_WF4 mode.
-    int ref_nrx_samps = NRX_SAMPS_CHANS(8); // 8-ch mode has the smallest FPGA buffer size
-    int norm_nrx_samps;
-    double gps_delay2 = 0;
-    // todo: this logic is handling bandwidth
-#if 0
-	switch (fw_sel) {
-	    case FW_SEL_SDR_RX4_WF4: norm_nrx_samps = nrx_samps - ref_nrx_samps; break;
-	    case FW_SEL_SDR_RX8_WF2: norm_nrx_samps = nrx_samps; break;
-	    case FW_SEL_SDR_RX14_WF0: norm_nrx_samps = nrx_samps; break;    // FIXME: this is now the smallest buffer size
-	    case FW_SEL_SDR_RX3_WF3: const double target = 15960.828e-6;      // empirically measured using GPS 1 PPS input
-	                             norm_nrx_samps = (int) (target * SND_RATE_3CH);
-	                             gps_delay2 = target - (double) norm_nrx_samps / SND_RATE_3CH; // fractional part of target delay
-	                             break;
-	}
-	//printf("rx_chans=%d norm_nrx_samps=%d nrx_samps=%d ref_nrx_samps=%d gps_delay2=%e\n",
-	//    rx_chans, norm_nrx_samps, nrx_samps, ref_nrx_samps, gps_delay2);
-#else
-    norm_nrx_samps = nrx_samps - ref_nrx_samps;
-#endif
     // clprintf(conn, "SND INIT conn: %p mc: %p %s:%d %s\n",
     //	conn, conn->mc, conn->remote_ip, conn->remote_port, conn->mc->uri);
 
@@ -490,7 +456,6 @@ void c2s_sound(void* param) {
         tid_t receive_iq_post_agc_tid = isNBFM ? (tid_t)NULL : ext_users[rx_chan].receive_iq_post_agc_tid;
 
         int ns_out;
-        int fir_pos;
 
         do { // while (bc < LOOP_BC)
             while (rx->wr_pos == rx->rd_pos) {
@@ -526,28 +491,8 @@ void c2s_sound(void* param) {
 
             TYPECPX* in_samps_c = rx->in_samps[rx->rd_pos];
 
-            // check 48-bit ticks counter timestamp in audio IQ stream
-            const u64_t ticks = rx->ticks[rx->rd_pos];
-            const u64_t dt = time_diff48(ticks, clk.ticks); // time difference to last GPS solution
-#if 0
-			static u64_t last_ticks[MAX_RX_CHANS] = {0};
-			static u4_t  tick_seq[MAX_RX_CHANS]   = {0};
-			const u64_t diff_ticks = time_diff48(ticks, last_ticks[rx_chan]); // time difference to last buffer
-			
-			if ((tick_seq[rx_chan] % 32) == 0) printf("ticks %08x|%08x %08x|%08x // %08x|%08x %08x|%08x #%d,%d GPST %f\n",
-											 PRINTF_U64_ARG(ticks), PRINTF_U64_ARG(diff_ticks),
-											 PRINTF_U64_ARG(dt), PRINTF_U64_ARG(clk.ticks),
-											 clk.adc_gps_clk_corrections, clk.adc_clk_corrections, clk.gps_secs);
-			if (diff_ticks != rx_decim * nrx_samps)
-				printf("ticks %08x|%08x %08x|%08x // %08x|%08x %08x|%08x #%d,%d GPST %f (%d) *****\n",
-					   PRINTF_U64_ARG(ticks), PRINTF_U64_ARG(diff_ticks),
-					   PRINTF_U64_ARG(dt), PRINTF_U64_ARG(clk.ticks),
-					   clk.adc_gps_clk_corrections, clk.adc_clk_corrections, clk.gps_secs,
-					   tick_seq[rx_chan]);
-			last_ticks[rx_chan] = ticks;
-			tick_seq[rx_chan]++;
-#endif
-            gps_tsp->gpssec = fmod(gps_week_sec + clk.gps_secs + dt / clk.adc_clock_base - gps_delay + gps_delay2, gps_week_sec);
+            // RX_READ supplies samples without a hardware time anchor.
+            // Do not subtract the PPS period count from an absent sample tick.
 
 #ifdef SND_SEQ_CHECK
             if (rx->in_seq[rx->rd_pos] != s->snd_seq_ck) {
@@ -600,7 +545,7 @@ void c2s_sound(void* param) {
 
             TYPECPX* fir_samps_c = &iq->iq_samples[iq->iq_wr_pos][0];
             ns_out = m_PassbandFIR[rx_chan].ProcessData(rx_chan, ns_in, in_samps_c, fir_samps_c);
-            fir_pos = m_PassbandFIR[rx_chan].FirPos();
+            // FIR processing is unchanged; sample-time qualification is unavailable.
 
             // FIR has a pipeline delay:
             //   gpssec=          t_0     t_1   t_2   t_3   t_4     t_5   t_6   t_7
@@ -634,24 +579,7 @@ void c2s_sound(void* param) {
             if (ns_out == 0)
                 continue;
 
-            // correct GPS timestamp for offset in the FIR filter
-            //  (1) delay in FIR filter
-            int sample_filter_delays = norm_nrx_samps - fir_pos;
-            //  (2) delay in AGC (if on)
-            if (s->agc)
-                sample_filter_delays -= m_Agc[rx_chan].GetDelaySamples();
-            gps_tsp->gpssec = fmod(gps_week_sec + gps_tsp->gpssec + rx_decim * sample_filter_delays / clk.adc_clock_base,
-                                   gps_week_sec);
-
-            // FIXME: could this block be moved outside the loop since it only effects the header?
-            s->out_pkt_iq.h.gpssec = u4_t(gps_tsp->last_gpssec);
-            s->out_pkt_iq.h.gpsnsec = gps_tsp->init ? u4_t(1e9 * (gps_tsp->last_gpssec - s->out_pkt_iq.h.gpssec)) : 0;
-            // real_printf("__GPS__ gpssec=%.9f diff=%.9f\n",  gps_tsp->gpssec, gps_tsp->gpssec - gps_tsp->last_gpssec);
-            const double dt_to_pos_sol = gps_tsp->last_gpssec - clk.gps_secs;
-            s->out_pkt_iq.h.last_gps_solution = gps_tsp->init ? ((clk.ticks == 0) ? 255 : u1_t(std::min((double)254.0, dt_to_pos_sol))) : 0;
-            if (!gps_tsp->init) gps_tsp->init = true;
-            s->out_pkt_iq.h.dummy = 0;
-            gps_tsp->last_gpssec = gps_tsp->gpssec;
+            set_unavailable_iq_timing(s->out_pkt_iq.h, allow_gps_tstamp);
 
             iq->iq_seqnum[iq->iq_wr_pos] = iq->iq_seq;
             iq->iq_seq++;
@@ -1304,13 +1232,8 @@ void c2s_sound(void* param) {
         int c2s_sound_camp(rx_chan_t * rxc, conn_t * conn, u1_t flags, char* bp, int bytes, int aud_bytes, bool masked_area);
 
         if (IQ_or_DRM_or_stereo) {
-            // allow GPS timestamps to be seen by internal extensions
-            // but selectively remove from external connections (see admin page security tab)
-            if (!allow_gps_tstamp) {
-                s->out_pkt_iq.h.last_gps_solution = 0;
-                s->out_pkt_iq.h.gpssec = 0;
-                s->out_pkt_iq.h.gpsnsec = 0;
-            }
+            // Also apply on the final wire path; stale headers must never escape.
+            set_unavailable_iq_timing(s->out_pkt_iq.h, allow_gps_tstamp);
             const int bytes = sizeof(s->out_pkt_iq.h) + bc;
             app_to_web(conn, (char*)&s->out_pkt_iq, bytes);
             aud_bytes = sizeof(s->out_pkt_iq.h.smeter) + bc;

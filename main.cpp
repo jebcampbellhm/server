@@ -23,6 +23,7 @@ Boston, MA  02110-1301, USA.
 #include "valgrind.h"
 #include "rx.h"
 #include "clk.h"
+#include "init/rx_rate.h"
 #include "misc.h"
 #include "str.h"
 #include "web.h"
@@ -254,19 +255,12 @@ int main(int argc, char* argv[]) {
         wf_chans = (signature >> 8) & 0x0f;
 
     snd_rate = 12000 * (1 + kiwi.snd_rate);// * 2;
-    if (kiwi.airband) {
-        u4_t adc_hz = adc_clock_nominal_hz();
-        u4_t decim_quantum = snd_rate * 256U;
-        if (adc_hz % decim_quantum != 0) {
-            lprintf("airband: ADC clock %u is not divisible by audio decimation quantum %u\n",
-                adc_hz, decim_quantum);
-            panic("airband ADC clock/audio rate mismatch");
-        }
-        fpga_rx_decim = adc_hz / decim_quantum;
-        rx_decim = fpga_rx_decim * 256;
-    } else {
-        rx_decim = (int)(ADC_CLOCK_TYP / snd_rate);
-        fpga_rx_decim = rx_decim / 256;
+    if (!rx_rate_divisors(adc_clock_nominal_hz(), snd_rate, rx_decim, fpga_rx_decim)) {
+        lprintf("Unsupported ADC clock/audio rate: %u Hz / %d Hz. "
+                "The FPGA requires an integer factor of 256; select a supported rate "
+                "(12 or 24 kHz for HF). No receiver stream was started.\n",
+                adc_clock_nominal_hz(), snd_rate);
+        panic("ADC clock/audio rate mismatch");
     }
     lprintf("firmware: rx_decim=%d fpga_decim=%d sndrate=%dkHz real_rate=%.3f\n",
         rx_decim, fpga_rx_decim, snd_rate / 1000, ADC_CLOCK_TYP / rx_decim);
